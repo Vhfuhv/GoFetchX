@@ -1,0 +1,160 @@
+package downloader
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+)
+
+func AppConfigDir() string {
+	base, err := os.UserConfigDir()
+	if err != nil || base == "" {
+		return "."
+	}
+	return filepath.Join(base, defaultDownloadSubfolder)
+}
+
+func appStateDir() string {
+	base, err := os.UserCacheDir()
+	if err != nil || base == "" {
+		return "."
+	}
+	return filepath.Join(base, defaultDownloadSubfolder, "state")
+}
+
+func DefaultDownloadDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "."
+	}
+	return filepath.Join(home, "Downloads", defaultDownloadSubfolder)
+}
+
+func EnsureDir(path string) error {
+	return os.MkdirAll(path, 0o755)
+}
+
+func (d *EnhancedDownloader) stateFileFromURL(url string) string {
+	hash := sha256.Sum256([]byte(url))
+	return "download_" + hex.EncodeToString(hash[:8]) + ".json"
+}
+
+func (d *EnhancedDownloader) currentStatePath() string {
+	return filepath.Join(appStateDir(), d.stateFileFromURL(d.URL))
+}
+
+func legacyStatePath(url string) string {
+	hash := sha256.Sum256([]byte(url))
+	return "download_" + hex.EncodeToString(hash[:8]) + ".json"
+}
+
+func (d *EnhancedDownloader) saveState() error {
+	if d.State == nil {
+		return nil
+	}
+
+	if err := EnsureDir(appStateDir()); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(d.State, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	d.StateFile = d.currentStatePath()
+	return os.WriteFile(d.StateFile, data, 0o644)
+}
+
+func (d *EnhancedDownloader) forceSaveState() error {
+	if err := d.saveState(); err != nil {
+		return err
+	}
+	d.lastStateSave = time.Now()
+	d.pendingBytes = 0
+	return nil
+}
+
+func (d *EnhancedDownloader) maybeSaveStateLocked() error {
+	if time.Since(d.lastStateSave) < stateSaveInterval && d.pendingBytes < stateSaveBytesThreshold {
+		return nil
+	}
+	return d.forceSaveState()
+}
+
+func (d *EnhancedDownloader) loadState() error {
+	currentPath := d.currentStatePath()
+	data, err := os.ReadFile(currentPath)
+	if err == nil {
+		var state DownloadState
+		if err := json.Unmarshal(data, &state); err != nil {
+			return err
+		}
+		d.StateFile = currentPath
+		d.State = &state
+		return nil
+	}
+
+	legacyPath := legacyStatePath(d.URL)
+	data, legacyErr := os.ReadFile(legacyPath)
+	if legacyErr != nil {
+		return fmt.Errorf("state file not found")
+	}
+
+	var state DownloadState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return err
+	}
+
+	d.StateFile = currentPath
+	d.State = &state
+	_ = d.saveState()
+	_ = os.Remove(legacyPath)
+	return nil
+}
+
+func (d *EnhancedDownloader) calculateChunks(totalSize int64) []Chunk {
+	if totalSize < minFileSizeForChunking {
+		return []Chunk{{ID: 0, Start: 0, End: totalSize - 1}}
+	}
+
+	chunkCount := int(totalSize / maxBlockSize)
+	if totalSize%maxBlockSize != 0 {
+		chunkCount++
+	}
+	if chunkCount < d.Concurrency {
+		chunkCount = d.Concurrency
+	}
+
+	if maxCount := int(totalSize / minBlockSize); chunkCount > maxCount {
+		chunkCount = maxCount
+	}
+	if chunkCount < 1 {
+		chunkCount = 1
+	}
+
+	chunkSize := totalSize / int64(chunkCount)
+	var chunks []Chunk
+	var start int64
+
+	for i := 0; i < chunkCount; i++ {
+		end := start + chunkSize - 1
+		if end >= totalSize || i == chunkCount-1 {
+			end = totalSize - 1
+		}
+
+		chunks = append(chunks, Chunk{
+			ID:    i,
+			Start: start,
+			End:   end,
+		})
+
+		start = end + 1
+	}
+
+	return chunks
+}
