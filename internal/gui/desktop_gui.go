@@ -5,6 +5,8 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"image/color"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
@@ -37,7 +40,8 @@ type DownloadItem struct {
 	downloader *downloader.EnhancedDownloader
 
 	progressBar *widget.ProgressBar
-	statusLabel *widget.Label
+	statusLabel *canvas.Text
+	metaLabel   *widget.Label
 	infoLabel   *widget.Label
 	fileLabel   *widget.Label
 
@@ -82,6 +86,7 @@ func NewDownloadGUI() *DownloadGUI {
 
 func (g *DownloadGUI) Show() {
 	g.buildUI()
+	g.restoreDownloads()
 	g.window.ShowAndRun()
 }
 
@@ -231,23 +236,114 @@ func (g *DownloadGUI) refreshList() {
 	g.listArea.Refresh()
 }
 
+func (g *DownloadGUI) restoreDownloads() {
+	recovered, err := downloader.LoadRecoverableDownloaders()
+	if err != nil {
+		return
+	}
+
+	for _, dlr := range recovered {
+		state, ok := dlr.Snapshot()
+		if !ok {
+			continue
+		}
+
+		if state.DownloadDir == "" && g.config.DownloadDir != "" {
+			dlr.SetDownloadDir(g.config.DownloadDir)
+		}
+
+		item := &DownloadItem{
+			ID:         fmt.Sprintf("recover_%d", time.Now().UnixNano()),
+			URL:        state.URL,
+			Status:     state.Status,
+			downloader: dlr,
+			stopListen: make(chan struct{}),
+		}
+
+		g.downloads = append(g.downloads, item)
+		go g.listenDownload(item)
+	}
+
+	if len(recovered) > 0 {
+		g.refreshList()
+	}
+}
+
 // buildCard 构建单个下载卡片
 func (g *DownloadGUI) buildCard(dl *DownloadItem) *fyne.Container {
-	urlLabel := widget.NewLabel(dl.URL)
-	urlLabel.Wrapping = fyne.TextWrapWord
-
-	statusLabel := widget.NewLabel(statusText(dl.Status))
-	statusLabel.TextStyle = fyne.TextStyle{Bold: true}
-	dl.statusLabel = statusLabel
+	statusTextView := canvas.NewText(statusText(dl.Status), statusColor(dl.Status))
+	statusTextView.TextStyle = fyne.TextStyle{Bold: true}
+	statusTextView.TextSize = 12
+	dl.statusLabel = statusTextView
+	statusBadgeBg := canvas.NewRectangle(statusBadgeColor(dl.Status))
+	statusBadgeBg.CornerRadius = 8
+	statusBadge := container.NewPadded(container.NewStack(
+		statusBadgeBg,
+		container.NewCenter(statusTextView),
+	))
 
 	progressBar := widget.NewProgressBar()
 	dl.progressBar = progressBar
 
-	infoLabel := widget.NewLabel("初始化中...")
+	metaLabel := widget.NewLabel("等待中...")
+	dl.metaLabel = metaLabel
+
+	infoLabel := widget.NewLabel("大小信息准备中...")
 	dl.infoLabel = infoLabel
 
-	fileLabel := widget.NewLabel("")
+	fileLabel := widget.NewLabel(compactText(fileNameForCard(dl), 42))
+	fileLabel.TextStyle = fyne.TextStyle{Bold: true}
 	dl.fileLabel = fileLabel
+
+	sourceLabel := widget.NewLabel(compactSource(dl.URL, 64))
+	linkBtn := widget.NewButtonWithIcon("链接", theme.ContentCopyIcon(), func() {
+		dialog.ShowInformation("下载链接", dl.URL, g.window)
+	})
+	linkBtn.Importance = widget.LowImportance
+	detailURL := widget.NewLabel(dl.URL)
+	detailURL.Wrapping = fyne.TextWrapWord
+	detailPath := widget.NewLabel(dl.downloader.FilePath())
+	detailPath.Wrapping = fyne.TextWrapWord
+	detailBox := container.NewVBox(
+		widget.NewLabel("完整链接"),
+		detailURL,
+		widget.NewSeparator(),
+		widget.NewLabel("保存位置"),
+		detailPath,
+	)
+	detailBox.Hide()
+	var toggleBtn *widget.Button
+	toggleBtn = widget.NewButtonWithIcon("详情", theme.MenuExpandIcon(), func() {
+		if detailBox.Visible() {
+			detailBox.Hide()
+			toggleBtn.SetText("详情")
+			toggleBtn.SetIcon(theme.MenuExpandIcon())
+		} else {
+			detailBox.Show()
+			toggleBtn.SetText("收起")
+			toggleBtn.SetIcon(theme.MenuDropDownIcon())
+		}
+	})
+	toggleBtn.Importance = widget.LowImportance
+
+	if state, ok := dl.downloader.Snapshot(); ok {
+		if state.TotalSize > 0 {
+			progressBar.SetValue(float64(state.DownloadedSize) / float64(state.TotalSize))
+			metaLabel.SetText(formatProgressMeta(state))
+			infoLabel.SetText(formatProgressInfo(state))
+		} else {
+			metaLabel.SetText(statusText(state.Status))
+			infoLabel.SetText("等待中...")
+		}
+
+		if state.FileName != "" {
+			fileLabel.SetText(compactText(state.FileName, 42))
+		}
+
+		if filePath := dl.downloader.FilePath(); filePath != "" {
+			detailPath.SetText(filePath)
+		}
+	}
 
 	// 根据状态构建按钮
 	var buttons []fyne.CanvasObject
@@ -291,14 +387,19 @@ func (g *DownloadGUI) buildCard(dl *DownloadItem) *fyne.Container {
 	}
 
 	buttonBox := container.NewHBox(buttons...)
+	headerRow := container.NewBorder(nil, nil, fileLabel, statusBadge)
+	sourceActions := container.NewHBox(linkBtn, toggleBtn)
+	sourceRow := container.NewBorder(nil, nil, sourceLabel, sourceActions)
+	metaRow := container.NewHBox(metaLabel)
 	infoRow := container.NewBorder(nil, nil, infoLabel, buttonBox)
 
 	card := container.NewVBox(
-		urlLabel,
-		container.NewHBox(statusLabel, layout.NewSpacer(), fileLabel),
+		headerRow,
+		sourceRow,
 		progressBar,
+		metaRow,
 		infoRow,
-		widget.NewSeparator(),
+		detailBox,
 	)
 
 	return container.NewPadded(card)
@@ -357,22 +458,27 @@ func (g *DownloadGUI) listenDownload(dl *DownloadItem) {
 						elapsed = fmt.Sprintf(" | %d:%02d", minutes, seconds)
 					}
 
-					if dl.infoLabel != nil {
-						dl.infoLabel.SetText(fmt.Sprintf("%.2f MB / %.2f MB (%.1f%%) | %.2f MB/s%s",
-							float64(downloaded)/1024/1024,
-							float64(total)/1024/1024,
+					if dl.metaLabel != nil {
+						dl.metaLabel.SetText(fmt.Sprintf("进度 %.1f%% | 速度 %.2f MB/s%s",
 							progress*100,
 							speed,
 							elapsed))
 					}
+					if dl.infoLabel != nil {
+						dl.infoLabel.SetText(fmt.Sprintf("已下载 %.2f MB / %.2f MB",
+							float64(downloaded)/1024/1024,
+							float64(total)/1024/1024))
+					}
 				}
 
 				if dl.fileLabel != nil && fileName != "" {
-					dl.fileLabel.SetText(fileName)
+					dl.fileLabel.SetText(compactText(fileName, 42))
 				}
 
 				if dl.statusLabel != nil {
-					dl.statusLabel.SetText(statusText(status))
+					dl.statusLabel.Text = statusText(status)
+					dl.statusLabel.Color = statusColor(status)
+					dl.statusLabel.Refresh()
 				}
 			})
 
@@ -427,7 +533,7 @@ func (g *DownloadGUI) removeDownload(dl *DownloadItem) {
 
 // openFolder 在系统文件管理器中打开下载文件所在目录
 func (g *DownloadGUI) openFolder(dl *DownloadItem) {
-	if dl.downloader == nil || dl.downloader.State == nil {
+	if dl.downloader == nil {
 		return
 	}
 	path := dl.downloader.FilePath()
@@ -493,6 +599,115 @@ func statusText(status string) string {
 		return t
 	}
 	return status
+}
+
+func formatProgressInfo(state downloader.DownloadState) string {
+	if state.TotalSize <= 0 {
+		return "等待中..."
+	}
+
+	return fmt.Sprintf("已下载 %.2f MB / %.2f MB",
+		float64(state.DownloadedSize)/1024/1024,
+		float64(state.TotalSize)/1024/1024,
+	)
+}
+
+func formatProgressMeta(state downloader.DownloadState) string {
+	if state.TotalSize <= 0 {
+		return statusText(state.Status)
+	}
+
+	progress := float64(state.DownloadedSize) / float64(state.TotalSize) * 100
+	elapsedSeconds := state.AccumulatedDuration
+	switch {
+	case state.Status == "completed" && state.FinalDuration > 0:
+		elapsedSeconds = state.FinalDuration
+	case state.Status == "running" && !state.DownloadStartTime.IsZero():
+		elapsedSeconds += time.Since(state.DownloadStartTime).Seconds()
+	}
+
+	parts := []string{fmt.Sprintf("进度 %.1f%%", progress)}
+	if state.CurrentSpeed > 0 || state.Status == "running" {
+		parts = append(parts, fmt.Sprintf("速度 %.2f MB/s", state.CurrentSpeed))
+	}
+	if elapsedSeconds > 0 {
+		minutes := int(elapsedSeconds) / 60
+		seconds := int(elapsedSeconds) % 60
+		parts = append(parts, fmt.Sprintf("用时 %d:%02d", minutes, seconds))
+	}
+
+	return strings.Join(parts, " | ")
+}
+
+func fileNameForCard(dl *DownloadItem) string {
+	if dl.downloader != nil {
+		if state, ok := dl.downloader.Snapshot(); ok && strings.TrimSpace(state.FileName) != "" {
+			return state.FileName
+		}
+	}
+	return "未命名下载任务"
+}
+
+func compactSource(raw string, limit int) string {
+	if parsed, err := url.Parse(raw); err == nil {
+		host := parsed.Host
+		path := parsed.Path
+		if path == "" {
+			path = "/"
+		}
+		return compactText(host+path, limit)
+	}
+	return compactText(raw, limit)
+}
+
+func compactText(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if text == "" || limit <= 0 {
+		return text
+	}
+
+	runes := []rune(text)
+	if len(runes) <= limit {
+		return text
+	}
+	if limit <= 1 {
+		return string(runes[:limit])
+	}
+	return string(runes[:limit-1]) + "…"
+}
+
+func statusColor(status string) color.Color {
+	switch status {
+	case "running":
+		return color.NRGBA{R: 18, G: 122, B: 72, A: 255}
+	case "paused":
+		return color.NRGBA{R: 161, G: 98, B: 7, A: 255}
+	case "completed":
+		return color.NRGBA{R: 29, G: 78, B: 216, A: 255}
+	case "error":
+		return color.NRGBA{R: 185, G: 28, B: 28, A: 255}
+	case "cancelled":
+		return color.NRGBA{R: 107, G: 114, B: 128, A: 255}
+	default:
+		return color.NRGBA{R: 75, G: 85, B: 99, A: 255}
+	}
+}
+
+func statusBadgeColor(status string) color.Color {
+	switch status {
+	case "running":
+		return color.NRGBA{R: 220, G: 252, B: 231, A: 255}
+	case "paused":
+		return color.NRGBA{R: 254, G: 243, B: 199, A: 255}
+	case "completed":
+		return color.NRGBA{R: 219, G: 234, B: 254, A: 255}
+	case "error":
+		return color.NRGBA{R: 254, G: 226, B: 226, A: 255}
+	case "cancelled":
+		return color.NRGBA{R: 229, G: 231, B: 235, A: 255}
+	default:
+		return color.NRGBA{R: 243, G: 244, B: 246, A: 255}
+	}
 }
 
 func parseConcurrency(selected string) int {
