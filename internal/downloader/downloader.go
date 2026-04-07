@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,17 +30,20 @@ type EnhancedDownloader struct {
 	removeState   bool
 	lastStateSave time.Time
 	pendingBytes  int64
+	proxyConfig   ProxyConfig
 }
 
 func NewEnhancedDownloader(url string, concurrency int) *EnhancedDownloader {
+	transport := &http.Transport{
+		MaxIdleConnsPerHost: concurrency,
+		IdleConnTimeout:     90 * time.Second,
+	}
+
 	return &EnhancedDownloader{
 		URL: url,
 		Client: &http.Client{
 			Timeout: 30 * time.Minute,
-			Transport: &http.Transport{
-				MaxIdleConnsPerHost: concurrency,
-				IdleConnTimeout:     90 * time.Second,
-			},
+			Transport: transport,
 		},
 		Concurrency: concurrency,
 		speedRatio:  0.7,
@@ -55,6 +59,14 @@ func NewDownloaderFromState(state DownloadState, stateFile string) *EnhancedDown
 	d.State = &state
 	d.StateFile = stateFile
 	return d
+}
+
+func (d *EnhancedDownloader) SetProxyConfig(cfg ProxyConfig) error {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+
+	d.proxyConfig = cfg
+	return d.applyProxyLocked()
 }
 
 func (d *EnhancedDownloader) SetDownloadDir(dir string) {
@@ -100,6 +112,40 @@ func (d *EnhancedDownloader) SetSpeedRatio(ratio float64) error {
 		newLimit := int64(float64(d.bandwidthInfo.AvailableBandwidth) * ratio)
 		d.bandwidthInfo.RecommendedLimit = newLimit
 		d.rateLimiter = NewRateLimiter(newLimit / 8)
+	}
+
+	return nil
+}
+
+func (d *EnhancedDownloader) applyProxyLocked() error {
+	transport, ok := d.Client.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		transport = &http.Transport{
+			MaxIdleConnsPerHost: d.Concurrency,
+			IdleConnTimeout:     90 * time.Second,
+		}
+		d.Client.Transport = transport
+	}
+
+	switch d.proxyConfig.Mode {
+	case "", "direct":
+		transport.Proxy = nil
+	case "system":
+		transport.Proxy = http.ProxyFromEnvironment
+	case "manual":
+		host := strings.TrimSpace(d.proxyConfig.Host)
+		port := strings.TrimSpace(d.proxyConfig.Port)
+		if host == "" || port == "" {
+			return fmt.Errorf("proxy host and port are required")
+		}
+
+		proxyURL, err := neturl.Parse("http://" + host + ":" + port)
+		if err != nil {
+			return fmt.Errorf("invalid proxy address: %w", err)
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	default:
+		return fmt.Errorf("unsupported proxy mode: %s", d.proxyConfig.Mode)
 	}
 
 	return nil

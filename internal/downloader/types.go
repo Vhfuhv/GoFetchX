@@ -2,6 +2,12 @@ package downloader
 
 import "time"
 
+type ProxyConfig struct {
+	Mode string `json:"mode"`
+	Host string `json:"host,omitempty"`
+	Port string `json:"port,omitempty"`
+}
+
 type Chunk struct {
 	ID        int
 	Start     int64

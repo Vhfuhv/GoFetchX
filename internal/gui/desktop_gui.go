@@ -29,7 +29,8 @@ var iconPNG []byte
 
 // AppConfig 持久化配置
 type AppConfig struct {
-	DownloadDir string `json:"download_dir"`
+	DownloadDir string                 `json:"download_dir"`
+	Proxy       downloader.ProxyConfig `json:"proxy"`
 }
 
 // DownloadItem 下载项
@@ -58,6 +59,7 @@ type DownloadGUI struct {
 	urlEntry    *widget.Entry
 	concurrency *widget.Select
 	speedRatio  *widget.Select
+	proxyLabel  *widget.Label
 	listArea    *fyne.Container
 }
 
@@ -92,10 +94,12 @@ func (g *DownloadGUI) Show() {
 
 // buildUI 构建主界面
 func (g *DownloadGUI) buildUI() {
-	// 菜单栏
 	settingsMenu := fyne.NewMenu("设置",
 		fyne.NewMenuItem("下载路径...", func() {
 			g.showSettingsDialog()
+		}),
+		fyne.NewMenuItem("代理设置...", func() {
+			g.showProxyDialog()
 		}),
 	)
 	helpMenu := fyne.NewMenu("帮助",
@@ -119,6 +123,9 @@ func (g *DownloadGUI) buildUI() {
 		g.startDownload()
 	})
 	startBtn.Importance = widget.HighImportance
+	g.proxyLabel = widget.NewLabel("")
+	g.proxyLabel.TextStyle = fyne.TextStyle{Italic: true}
+	g.refreshProxyLabel()
 
 	inputForm := container.NewVBox(
 		container.NewBorder(nil, nil, widget.NewLabel("链接:"), nil, g.urlEntry),
@@ -127,6 +134,7 @@ func (g *DownloadGUI) buildUI() {
 			container.NewBorder(nil, nil, widget.NewLabel("带宽:"), nil, g.speedRatio),
 			startBtn,
 		),
+		g.proxyLabel,
 	)
 
 	// 下载列表
@@ -179,6 +187,70 @@ func (g *DownloadGUI) showSettingsDialog() {
 	dlg.Show()
 }
 
+func (g *DownloadGUI) showProxyDialog() {
+	modeOptions := []string{"Direct", "System", "Manual"}
+	modeSelect := widget.NewSelect(modeOptions, nil)
+	modeSelect.SetSelected(proxyModeLabel(g.config.Proxy.Mode))
+
+	modeHint := widget.NewLabel("")
+	hostEntry := widget.NewEntry()
+	hostEntry.SetText(g.config.Proxy.Host)
+	hostEntry.SetPlaceHolder("127.0.0.1")
+
+	portEntry := widget.NewEntry()
+	portEntry.SetText(g.config.Proxy.Port)
+	portEntry.SetPlaceHolder("7890")
+
+	applyModeState := func(mode string) {
+		switch proxyModeValue(mode) {
+		case "manual":
+			hostEntry.Enable()
+			portEntry.Enable()
+			modeHint.SetText("Manual mode uses the proxy address you enter, for example 127.0.0.1:7890.")
+		case "system":
+			hostEntry.Disable()
+			portEntry.Disable()
+			modeHint.SetText("System mode follows the current system proxy settings and does not need host or port.")
+		default:
+			hostEntry.Disable()
+			portEntry.Disable()
+			modeHint.SetText("Direct mode does not use any proxy.")
+		}
+	}
+	modeSelect.OnChanged = applyModeState
+	applyModeState(modeSelect.Selected)
+
+	form := dialog.NewForm("Proxy Settings", "Save", "Cancel", []*widget.FormItem{
+		widget.NewFormItem("Mode", modeSelect),
+		widget.NewFormItem("Host", hostEntry),
+		widget.NewFormItem("Port", portEntry),
+		widget.NewFormItem("", modeHint),
+	}, func(ok bool) {
+		if !ok {
+			return
+		}
+
+		cfg := downloader.ProxyConfig{
+			Mode: proxyModeValue(modeSelect.Selected),
+			Host: strings.TrimSpace(hostEntry.Text),
+			Port: strings.TrimSpace(portEntry.Text),
+		}
+
+		testDownloader := downloader.NewEnhancedDownloader("https://example.com", 1)
+		if err := testDownloader.SetProxyConfig(cfg); err != nil {
+			dialog.ShowError(fmt.Errorf("invalid proxy config: %w", err), g.window)
+			return
+		}
+
+		g.config.Proxy = cfg
+		g.saveConfig()
+		g.refreshProxyLabel()
+		dialog.ShowInformation("Proxy Settings", "Proxy configuration saved. New tasks will use it immediately.", g.window)
+	}, g.window)
+	form.Resize(fyne.NewSize(460, 260))
+	form.Show()
+}
+
 // startDownload 开始新下载
 func (g *DownloadGUI) startDownload() {
 	url := strings.TrimSpace(g.urlEntry.Text)
@@ -194,6 +266,10 @@ func (g *DownloadGUI) startDownload() {
 
 	downloader := downloader.NewEnhancedDownloader(url, concurrency)
 	downloader.SetSpeedRatio(speedRatio)
+	if err := downloader.SetProxyConfig(g.config.Proxy); err != nil {
+		dialog.ShowError(fmt.Errorf("代理配置无效: %w", err), g.window)
+		return
+	}
 	if dir != "" {
 		downloader.SetDownloadDir(dir)
 	}
@@ -250,6 +326,9 @@ func (g *DownloadGUI) restoreDownloads() {
 
 		if state.DownloadDir == "" && g.config.DownloadDir != "" {
 			dlr.SetDownloadDir(g.config.DownloadDir)
+		}
+		if err := dlr.SetProxyConfig(g.config.Proxy); err != nil {
+			continue
 		}
 
 		item := &DownloadItem{
@@ -575,6 +654,9 @@ func (g *DownloadGUI) loadConfig() {
 	if strings.TrimSpace(g.config.DownloadDir) == "" {
 		g.config.DownloadDir = downloader.DefaultDownloadDir()
 	}
+	if strings.TrimSpace(g.config.Proxy.Mode) == "" {
+		g.config.Proxy.Mode = "direct"
+	}
 }
 
 func (g *DownloadGUI) saveConfig() {
@@ -707,6 +789,51 @@ func statusBadgeColor(status string) color.Color {
 		return color.NRGBA{R: 229, G: 231, B: 235, A: 255}
 	default:
 		return color.NRGBA{R: 243, G: 244, B: 246, A: 255}
+	}
+}
+
+func (g *DownloadGUI) refreshProxyLabel() {
+	if g.proxyLabel == nil {
+		return
+	}
+	g.proxyLabel.SetText("当前代理: " + proxySummary(g.config.Proxy))
+}
+
+func proxyModeLabel(mode string) string {
+	switch mode {
+	case "system":
+		return "System"
+	case "manual":
+		return "Manual"
+	default:
+		return "Direct"
+	}
+}
+
+func proxyModeValue(label string) string {
+	switch label {
+	case "System":
+		return "system"
+	case "Manual":
+		return "manual"
+	default:
+		return "direct"
+	}
+}
+
+func proxySummary(cfg downloader.ProxyConfig) string {
+	switch cfg.Mode {
+	case "system":
+		return "System"
+	case "manual":
+		host := strings.TrimSpace(cfg.Host)
+		port := strings.TrimSpace(cfg.Port)
+		if host == "" || port == "" {
+			return "Manual"
+		}
+		return fmt.Sprintf("Manual %s:%s", host, port)
+	default:
+		return "Direct"
 	}
 }
 
