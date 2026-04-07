@@ -13,6 +13,7 @@ type Chunk struct {
 type DownloadState struct {
 	URL                 string            `json:"url"`
 	FileName            string            `json:"file_name"`
+	DownloadDir         string            `json:"download_dir,omitempty"`
 	TotalSize           int64             `json:"total_size"`
 	DownloadedSize      int64             `json:"downloaded_size"`
 	Concurrency         int               `json:"concurrency"`

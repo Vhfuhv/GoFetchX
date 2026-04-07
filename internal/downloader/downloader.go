@@ -47,10 +47,23 @@ func NewEnhancedDownloader(url string, concurrency int) *EnhancedDownloader {
 	}
 }
 
+func NewDownloaderFromState(state DownloadState, stateFile string) *EnhancedDownloader {
+	d := NewEnhancedDownloader(state.URL, state.Concurrency)
+	if state.DownloadDir != "" {
+		d.DownloadDir = state.DownloadDir
+	}
+	d.State = &state
+	d.StateFile = stateFile
+	return d
+}
+
 func (d *EnhancedDownloader) SetDownloadDir(dir string) {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 	d.DownloadDir = dir
+	if d.State != nil {
+		d.State.DownloadDir = dir
+	}
 }
 
 func (d *EnhancedDownloader) Snapshot() (DownloadState, bool) {
@@ -107,6 +120,9 @@ func (d *EnhancedDownloader) Start() error {
 	d.removeState = false
 
 	if err := d.loadState(); err == nil && d.State != nil {
+		if d.State.DownloadDir != "" {
+			d.DownloadDir = d.State.DownloadDir
+		}
 		if d.State.Status == "paused" || d.State.Status == "error" {
 			fmt.Printf("found unfinished download, resuming\n")
 		} else if d.State.Status == "completed" {
@@ -129,6 +145,7 @@ func (d *EnhancedDownloader) Start() error {
 
 	d.State.Status = "running"
 	d.State.LastUpdateTime = time.Now()
+	d.State.DownloadDir = d.DownloadDir
 	d.lastStateSave = time.Time{}
 	d.pendingBytes = 0
 	_ = d.forceSaveState()
@@ -208,6 +225,7 @@ func (d *EnhancedDownloader) initializeNewDownload() error {
 	d.State = &DownloadState{
 		URL:            d.URL,
 		FileName:       filename,
+		DownloadDir:    d.DownloadDir,
 		TotalSize:      totalSize,
 		DownloadedSize: 0,
 		Concurrency:    d.Concurrency,

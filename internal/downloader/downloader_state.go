@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -67,7 +68,13 @@ func (d *EnhancedDownloader) saveState() error {
 	}
 
 	d.StateFile = d.currentStatePath()
-	return os.WriteFile(d.StateFile, data, 0o644)
+	tmpPath := d.StateFile + ".tmp"
+
+	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
+		return err
+	}
+
+	return replaceFileAtomically(tmpPath, d.StateFile)
 }
 
 func (d *EnhancedDownloader) forceSaveState() error {
@@ -88,33 +95,107 @@ func (d *EnhancedDownloader) maybeSaveStateLocked() error {
 
 func (d *EnhancedDownloader) loadState() error {
 	currentPath := d.currentStatePath()
-	data, err := os.ReadFile(currentPath)
+	state, err := readStateFile(currentPath)
 	if err == nil {
-		var state DownloadState
-		if err := json.Unmarshal(data, &state); err != nil {
-			return err
-		}
 		d.StateFile = currentPath
-		d.State = &state
+		d.State = state
+		if d.State.DownloadDir != "" {
+			d.DownloadDir = d.State.DownloadDir
+		}
 		return nil
 	}
 
 	legacyPath := legacyStatePath(d.URL)
-	data, legacyErr := os.ReadFile(legacyPath)
+	state, legacyErr := readStateFile(legacyPath)
 	if legacyErr != nil {
 		return fmt.Errorf("state file not found")
 	}
 
-	var state DownloadState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return err
-	}
-
 	d.StateFile = currentPath
-	d.State = &state
+	d.State = state
+	if d.State.DownloadDir != "" {
+		d.DownloadDir = d.State.DownloadDir
+	}
 	_ = d.saveState()
 	_ = os.Remove(legacyPath)
 	return nil
+}
+
+func stateDir() string {
+	return appStateDir()
+}
+
+func stateFilePaths() ([]string, error) {
+	if err := EnsureDir(stateDir()); err != nil {
+		return nil, err
+	}
+
+	entries, err := os.ReadDir(stateDir())
+	if err != nil {
+		return nil, err
+	}
+
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if filepath.Ext(name) != ".json" || strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		paths = append(paths, filepath.Join(stateDir(), name))
+	}
+
+	return paths, nil
+}
+
+func readStateFile(path string) (*DownloadState, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var state DownloadState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, err
+	}
+
+	return &state, nil
+}
+
+func LoadRecoverableDownloaders() ([]*EnhancedDownloader, error) {
+	paths, err := stateFilePaths()
+	if err != nil {
+		return nil, err
+	}
+
+	recovered := make([]*EnhancedDownloader, 0, len(paths))
+	for _, path := range paths {
+		state, err := readStateFile(path)
+		if err != nil {
+			continue
+		}
+
+		needsRewrite := false
+		switch state.Status {
+		case "completed", "cancelled":
+			continue
+		case "running":
+			state.Status = "paused"
+			state.CurrentSpeed = 0
+			state.LastUpdateTime = time.Now()
+			needsRewrite = true
+		}
+
+		d := NewDownloaderFromState(*state, path)
+		if needsRewrite {
+			_ = d.forceSaveState()
+		}
+		recovered = append(recovered, d)
+	}
+
+	return recovered, nil
 }
 
 func (d *EnhancedDownloader) calculateChunks(totalSize int64) []Chunk {
