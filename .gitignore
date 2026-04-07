@@ -2,3 +2,7 @@
 md/
 *.syso
 *.exe
+*.exe~
+*.dll
+*.zip
+*.msi
