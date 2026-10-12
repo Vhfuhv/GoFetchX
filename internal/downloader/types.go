@@ -25,6 +25,7 @@ type DownloadState struct {
 	Concurrency         int               `json:"concurrency"`
 	Chunks              []Chunk           `json:"chunks"`
 	Status              string            `json:"status"`
+	ErrorMessage        string            `json:"error_message,omitempty"`
 	CreatedTime         time.Time         `json:"created_time"`
 	LastUpdateTime      time.Time         `json:"last_update_time"`
 	DownloadStartTime   time.Time         `json:"download_start_time"`

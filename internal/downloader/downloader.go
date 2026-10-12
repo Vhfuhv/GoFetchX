@@ -16,6 +16,7 @@ var (
 	ErrDownloadRunning  = errors.New("download is already running")
 	ErrDownloadStopping = errors.New("previous download session is still stopping")
 	ErrDownloadInUse    = errors.New("download URL or target file is already active in another task")
+	ErrChecksumMismatch = errors.New("download checksum mismatch")
 )
 
 type downloadSession struct {
@@ -245,13 +246,26 @@ func (d *EnhancedDownloader) Start() error {
 		return err
 	}
 	pathKeys = append(pathKeys, fileKey)
+	// All bytes arrived, but final validation (or finalization) failed. A
+	// retry must fetch the content again rather than skip every completed chunk.
+	if d.State.Status == "error" && allChunksComplete(d.State.Chunks) {
+		for i := range d.State.Chunks {
+			d.State.Chunks[i].Completed = false
+			d.State.Chunks[i].Written = 0
+		}
+		d.State.DownloadedSize = 0
+		d.State.ActualHashes = make(map[string]string)
+	}
 	d.State.Status = "running"
+	d.State.ErrorMessage = ""
+	d.State.FinalDuration = 0
 	d.State.LastUpdateTime = time.Now()
 	d.State.DownloadDir = d.DownloadDir
 	d.lastStateSave = time.Time{}
 	d.pendingBytes = 0
 	if err := d.forceSaveState(); err != nil {
 		d.State.Status = "error"
+		d.State.ErrorMessage = err.Error()
 		return err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -533,13 +547,18 @@ func (d *EnhancedDownloader) finishSession(run *downloadSession, err error) {
 				}
 			}
 		}
+		if err == nil {
+			err = d.validateDownload(run.filePath)
+		}
 		if err != nil {
 			state.Status = "error"
+			state.ErrorMessage = err.Error()
+			state.FinalDuration = 0
 			fmt.Printf("\ndownload failed: %v\n", err)
 		} else {
 			state.Status = "completed"
+			state.ErrorMessage = ""
 			state.FinalDuration = state.AccumulatedDuration
-			d.validateDownload()
 			fmt.Printf("\ndownload completed: %s\n", run.filePath)
 		}
 	}
@@ -547,7 +566,21 @@ func (d *EnhancedDownloader) finishSession(run *downloadSession, err error) {
 		_ = os.Remove(d.StateFile)
 	} else if saveErr := d.forceSaveState(); saveErr != nil {
 		state.Status = "error"
+		state.ErrorMessage = saveErr.Error()
+		state.FinalDuration = 0
 		fmt.Printf("\nfailed to save download state: %v\n", saveErr)
 	}
 	d.run = nil
+}
+
+func allChunksComplete(chunks []Chunk) bool {
+	if len(chunks) == 0 {
+		return false
+	}
+	for _, chunk := range chunks {
+		if !chunk.Completed || chunk.Written != chunk.End-chunk.Start+1 {
+			return false
+		}
+	}
+	return true
 }

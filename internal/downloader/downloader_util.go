@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
@@ -87,32 +88,45 @@ func sanitizeFilename(name string) string {
 	return name
 }
 
-func (d *EnhancedDownloader) validateDownload() {
-	if len(d.State.ExpectedHashes) == 0 {
-		return
+// Content-MD5 encodes the 16-byte digest as Base64. ActualHashes stays in
+// hexadecimal for human-readable records and compatibility with existing JSON.
+// ETag is opaque metadata, not a checksum, and is deliberately not compared here.
+func (d *EnhancedDownloader) validateDownload(filePath string) error {
+	expectedMD5, present := d.State.ExpectedHashes["md5"]
+	if !present {
+		return nil
+	}
+	delete(d.State.ActualHashes, "md5")
+	expected, err := base64.StdEncoding.Strict().DecodeString(strings.TrimSpace(expectedMD5))
+	if err != nil {
+		return fmt.Errorf("invalid Content-MD5 Base64 value: %w", err)
+	}
+	if len(expected) != md5.Size {
+		return fmt.Errorf("invalid Content-MD5 digest length: got %d bytes, want %d", len(expected), md5.Size)
 	}
 
-	file, err := os.Open(d.filePath())
+	file, err := os.Open(filePath)
 	if err != nil {
-		return
+		return fmt.Errorf("failed to open file for MD5 verification: %w", err)
 	}
 	defer file.Close()
 
-	if expectedMD5, ok := d.State.ExpectedHashes["md5"]; ok {
-		hash := md5.New()
-		if _, err := io.Copy(hash, file); err == nil {
-			sum := hash.Sum(nil)
-			actualHex := hex.EncodeToString(sum)
-			actualBase64 := base64.StdEncoding.EncodeToString(sum)
-
-			d.State.ActualHashes["md5"] = actualHex
-			if actualBase64 == expectedMD5 {
-				fmt.Printf("MD5 verification passed: %s\n", actualHex)
-			} else {
-				fmt.Printf("MD5 verification failed, expected: %s, actual(base64): %s\n", expectedMD5, actualBase64)
-			}
-		}
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return fmt.Errorf("failed to read file during MD5 verification: %w", err)
 	}
+	sum := hash.Sum(nil)
+	actualHex := hex.EncodeToString(sum)
+	if d.State.ActualHashes == nil {
+		d.State.ActualHashes = make(map[string]string)
+	}
+	d.State.ActualHashes["md5"] = actualHex
+	if !bytes.Equal(sum, expected) {
+		return fmt.Errorf("%w: MD5 verification failed, expected(Base64): %s, actual(Base64): %s",
+			ErrChecksumMismatch, strings.TrimSpace(expectedMD5), base64.StdEncoding.EncodeToString(sum))
+	}
+	fmt.Printf("MD5 verification passed: %s\n", actualHex)
+	return nil
 }
 
 func (d *EnhancedDownloader) supportsRange(totalSize int64) (bool, error) {

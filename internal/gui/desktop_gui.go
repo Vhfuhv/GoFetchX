@@ -418,6 +418,13 @@ func (g *DownloadGUI) buildCard(dl *DownloadItem) *fyne.Container {
 	toggleBtn.Importance = widget.LowImportance
 
 	if state, ok := dl.downloader.Snapshot(); ok {
+		if state.ErrorMessage != "" {
+			errorLabel := widget.NewLabel(state.ErrorMessage)
+			errorLabel.Wrapping = fyne.TextWrapWord
+			detailBox.Add(widget.NewSeparator())
+			detailBox.Add(widget.NewLabel("失败原因"))
+			detailBox.Add(errorLabel)
+		}
 		if state.TotalSize > 0 {
 			progressBar.SetValue(float64(state.DownloadedSize) / float64(state.TotalSize))
 			metaLabel.SetText(formatProgressMeta(state))
