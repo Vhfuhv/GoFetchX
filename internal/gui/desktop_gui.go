@@ -258,6 +258,18 @@ func (g *DownloadGUI) startDownload() {
 		dialog.ShowInformation("提示", "请输入下载链接", g.window)
 		return
 	}
+	for _, existing := range g.downloads {
+		if existing.URL != url {
+			continue
+		}
+		if state, ok := existing.downloader.Snapshot(); ok && (state.Status == "paused" || state.Status == "error") {
+			g.resumeDownload(existing)
+		} else {
+			dialog.ShowInformation("提示", "该链接已有下载任务，请在下载列表中查看。", g.window)
+		}
+		g.urlEntry.SetText("")
+		return
+	}
 
 	dir := g.config.DownloadDir
 

@@ -7,7 +7,6 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +15,7 @@ import (
 var (
 	ErrDownloadRunning  = errors.New("download is already running")
 	ErrDownloadStopping = errors.New("previous download session is still stopping")
+	ErrDownloadInUse    = errors.New("download URL or target file is already active in another task")
 )
 
 type downloadSession struct {
@@ -25,6 +25,7 @@ type downloadSession struct {
 	state    *DownloadState
 	filePath string
 	started  time.Time
+	pathKeys []string
 }
 
 // EnhancedDownloader supports resumable ranged downloads.
@@ -203,6 +204,16 @@ func (d *EnhancedDownloader) Start() error {
 	if d.Concurrency < 1 {
 		return fmt.Errorf("concurrency must be positive")
 	}
+	stateKey, err := claimDownloadPath("state", d.currentStatePath(), d)
+	if err != nil {
+		return err
+	}
+	pathKeys := []string{stateKey}
+	defer func() {
+		if d.run == nil {
+			releaseDownloadPaths(d, pathKeys)
+		}
+	}()
 
 	if err := d.loadState(); err == nil && d.State != nil {
 		if d.State.DownloadDir != "" {
@@ -229,6 +240,11 @@ func (d *EnhancedDownloader) Start() error {
 		}
 	}
 
+	fileKey, err := claimDownloadPath("file", d.filePath(), d)
+	if err != nil {
+		return err
+	}
+	pathKeys = append(pathKeys, fileKey)
 	d.State.Status = "running"
 	d.State.LastUpdateTime = time.Now()
 	d.State.DownloadDir = d.DownloadDir
@@ -242,6 +258,7 @@ func (d *EnhancedDownloader) Start() error {
 	run := &downloadSession{
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		state: d.State, filePath: d.filePath(), started: time.Now(),
+		pathKeys: pathKeys,
 	}
 	d.run = run
 	d.sendNotify()
@@ -275,6 +292,13 @@ func (d *EnhancedDownloader) Cancel() {
 			_ = d.forceSaveState()
 			d.run.cancel()
 		} else {
+			// A second instance may have resumed this URL since we paused. Do
+			// not remove the state file while that instance owns it.
+			key, err := claimDownloadPath("state", d.currentStatePath(), d)
+			if err != nil {
+				return
+			}
+			defer releaseDownloadPaths(d, []string{key})
 			d.State.Status = "cancelled"
 			_ = os.Remove(d.StateFile)
 		}
@@ -316,6 +340,22 @@ func (d *EnhancedDownloader) initializeNewDownload() error {
 	}
 
 	filename := d.generateFilename(resp)
+	dir := d.DownloadDir
+	if dir == "" {
+		dir = DefaultDownloadDir()
+	}
+	reserved, filename, err := reserveDownloadFile(dir, filename)
+	if err != nil {
+		return err
+	}
+	saved := false
+	defer func() {
+		reserved.Close()
+		if !saved {
+			// This empty reservation was created by this failed initialization.
+			_ = os.Remove(reserved.Name())
+		}
+	}()
 
 	d.StateFile = d.stateFileFromURL(d.URL)
 	d.State = &DownloadState{
@@ -335,18 +375,15 @@ func (d *EnhancedDownloader) initializeNewDownload() error {
 	d.extractHashesFromHeaders(resp)
 	d.State.Chunks = d.calculateChunks(totalSize)
 
-	targetDir := filepath.Dir(d.filePath())
-	if err := os.MkdirAll(targetDir, 0o755); err != nil {
-		return fmt.Errorf("failed to create download directory: %w", err)
-	}
-
 	fmt.Printf("file: %s\n", filename)
 	fmt.Printf("size: %.2f MB\n", float64(totalSize)/1024/1024)
 	if d.DownloadDir != "" {
 		fmt.Printf("save path: %s\n", d.filePath())
 	}
 
-	return d.forceSaveState()
+	err = d.forceSaveState()
+	saved = err == nil
+	return err
 }
 
 func (d *EnhancedDownloader) extractHashesFromHeaders(resp *http.Response) {
@@ -475,6 +512,7 @@ func (d *EnhancedDownloader) finishSession(run *downloadSession, err error) {
 	defer d.mutex.Unlock()
 	defer d.sendNotify()
 	defer close(run.done)
+	defer releaseDownloadPaths(d, run.pathKeys)
 	defer run.cancel()
 
 	state := run.state

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,16 +26,10 @@ func (d *EnhancedDownloader) filePath() string {
 func (d *EnhancedDownloader) generateFilename(resp *http.Response) string {
 	contentDisposition := resp.Header.Get("Content-Disposition")
 	if contentDisposition != "" {
-		parts := strings.Split(contentDisposition, ";")
-		for _, part := range parts {
-			part = strings.TrimSpace(part)
-			if strings.HasPrefix(strings.ToLower(part), "filename=") {
-				filename := strings.TrimPrefix(part, "filename=")
-				filename = strings.Trim(filename, "\"")
-				filename = sanitizeFilename(filename)
-				if filename != "" {
-					return filename
-				}
+		if _, params, err := mime.ParseMediaType(contentDisposition); err == nil {
+			// ParseMediaType decodes filename* and prefers it over the ASCII fallback.
+			if filename := sanitizeFilename(params["filename"]); filename != "" {
+				return filename
 			}
 		}
 	}
@@ -52,9 +47,8 @@ func (d *EnhancedDownloader) generateFilename(resp *http.Response) string {
 
 func sanitizeFilename(name string) string {
 	name = strings.TrimSpace(name)
-	if decoded, err := url.QueryUnescape(name); err == nil {
-		name = decoded
-	}
+	// Header parameters and URL paths are decoded by their respective parsers.
+	// Decoding here would alter literal '+' and double-decode percent sequences.
 
 	replacer := strings.NewReplacer(
 		"<", "_",
