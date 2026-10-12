@@ -17,7 +17,7 @@ type chunkResponseError struct{ message string }
 func (e *chunkResponseError) Error() string { return e.message }
 
 // downloadChunkWithRetry retries a chunk download up to 5 times.
-func (d *EnhancedDownloader) downloadChunkWithRetry(run *downloadSession, file *os.File, c *Chunk, progressChan chan<- int64) error {
+func (d *EnhancedDownloader) downloadChunkWithRetry(run *downloadSession, file *os.File, c *Chunk) error {
 	const maxRetries = 5
 	var lastErr error
 
@@ -28,7 +28,7 @@ func (d *EnhancedDownloader) downloadChunkWithRetry(run *downloadSession, file *
 		default:
 		}
 
-		err := d.downloadAndWriteChunk(run, file, c, progressChan)
+		err := d.downloadAndWriteChunk(run, file, c)
 		if err == nil {
 			return nil
 		}
@@ -74,7 +74,7 @@ func retryDelay(err error, attempt int) time.Duration {
 }
 
 // downloadAndWriteChunk streams a ranged response to its offset in the file.
-func (d *EnhancedDownloader) downloadAndWriteChunk(run *downloadSession, file *os.File, c *Chunk, progressChan chan<- int64) error {
+func (d *EnhancedDownloader) downloadAndWriteChunk(run *downloadSession, file *os.File, c *Chunk) error {
 	req, err := http.NewRequestWithContext(run.ctx, "GET", run.state.URL, nil)
 	if err != nil {
 		return err
@@ -122,13 +122,6 @@ func (d *EnhancedDownloader) downloadAndWriteChunk(run *downloadSession, file *o
 	}
 
 	buf := make([]byte, 64*1024)
-	var pendingProgress int64
-	// Preserve progress for partial reads even if the request fails or is cancelled.
-	defer func() {
-		if pendingProgress > 0 {
-			progressChan <- pendingProgress
-		}
-	}()
 
 	for remaining > 0 {
 		if err := run.ctx.Err(); err != nil {
@@ -171,20 +164,19 @@ func (d *EnhancedDownloader) downloadAndWriteChunk(run *downloadSession, file *o
 			writeOffset := c.Start + c.Written
 			d.mutex.Unlock()
 
-			if _, writeErr := file.WriteAt(buf[:n], writeOffset); writeErr != nil {
+			written, writeErr := file.WriteAt(buf[:n], writeOffset)
+			d.mutex.Lock()
+			c.Written += int64(written)
+			run.state.DownloadedSize += int64(written)
+			run.state.LastUpdateTime = time.Now()
+			d.stateRevision++
+			d.mutex.Unlock()
+			remaining -= int64(written)
+			if writeErr != nil {
 				return writeErr
 			}
-
-			d.mutex.Lock()
-			c.Written += int64(n)
-			d.mutex.Unlock()
-
-			pendingProgress += int64(n)
-			remaining -= int64(n)
-
-			if pendingProgress >= 64*1024 {
-				progressChan <- pendingProgress
-				pendingProgress = 0
+			if written != n {
+				return io.ErrShortWrite
 			}
 		}
 
@@ -201,6 +193,7 @@ func (d *EnhancedDownloader) downloadAndWriteChunk(run *downloadSession, file *o
 
 	d.mutex.Lock()
 	c.Completed = true
+	d.stateRevision++
 	d.mutex.Unlock()
 
 	return nil

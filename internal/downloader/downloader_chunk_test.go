@@ -23,7 +23,7 @@ func testResponse(req *http.Request, body io.ReadCloser, contentRange string, le
 	}
 }
 
-func chunkFixture(t *testing.T, body io.ReadCloser, contentRange string, length int64) (*EnhancedDownloader, *downloadSession, *os.File, chan int64) {
+func chunkFixture(t *testing.T, body io.ReadCloser, contentRange string, length int64) (*EnhancedDownloader, *downloadSession, *os.File) {
 	t.Helper()
 	d := NewEnhancedDownloader("http://test.invalid/file.bin", 1)
 	d.State = &DownloadState{
@@ -46,16 +46,7 @@ func chunkFixture(t *testing.T, body io.ReadCloser, contentRange string, length 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	run := &downloadSession{ctx: ctx, cancel: cancel, state: d.State}
-	return d, run, file, make(chan int64, 100)
-}
-
-func totalProgress(progress chan int64) int64 {
-	close(progress)
-	var total int64
-	for n := range progress {
-		total += n
-	}
-	return total
+	return d, run, file
 }
 
 func assertNeighborUnchanged(t *testing.T, file *os.File) {
@@ -91,8 +82,8 @@ func TestChunkRejectsInvalidResponseMetadata(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			d, run, file, progress := chunkFixture(t, io.NopCloser(strings.NewReader("abcdefghij")), tc.contentRange, tc.length)
-			err := d.downloadChunkWithRetry(run, file, &d.State.Chunks[0], progress)
+			d, run, file := chunkFixture(t, io.NopCloser(strings.NewReader("abcdefghij")), tc.contentRange, tc.length)
+			err := d.downloadChunkWithRetry(run, file, &d.State.Chunks[0])
 			var responseErr *chunkResponseError
 			if !errors.As(err, &responseErr) {
 				t.Fatalf("expected range validation error, got %v", err)
@@ -100,7 +91,7 @@ func TestChunkRejectsInvalidResponseMetadata(t *testing.T) {
 			if chunk := d.State.Chunks[0]; chunk.Written != 0 || chunk.Completed {
 				t.Fatalf("invalid response accepted: %+v", chunk)
 			}
-			if n := totalProgress(progress); n != 0 {
+			if n := d.State.DownloadedSize; n != 0 {
 				t.Fatalf("invalid response reported %d bytes", n)
 			}
 			assertNeighborUnchanged(t, file)
@@ -109,14 +100,14 @@ func TestChunkRejectsInvalidResponseMetadata(t *testing.T) {
 }
 
 func TestChunkRejectsOversizedBodyWithoutOverwritingNeighbor(t *testing.T) {
-	d, run, file, progress := chunkFixture(t, io.NopCloser(strings.NewReader("abcdefghijEXTRA")), "bytes 0-9/20", -1)
-	if err := d.downloadChunkWithRetry(run, file, &d.State.Chunks[0], progress); err == nil {
+	d, run, file := chunkFixture(t, io.NopCloser(strings.NewReader("abcdefghijEXTRA")), "bytes 0-9/20", -1)
+	if err := d.downloadChunkWithRetry(run, file, &d.State.Chunks[0]); err == nil {
 		t.Fatal("oversized body accepted")
 	}
 	if chunk := d.State.Chunks[0]; chunk.Completed || chunk.Written != 0 {
 		t.Fatalf("unvalidated final buffer was committed: %+v", chunk)
 	}
-	if n := totalProgress(progress); n != 0 {
+	if n := d.State.DownloadedSize; n != 0 {
 		t.Fatalf("unvalidated final buffer reported %d bytes", n)
 	}
 	assertNeighborUnchanged(t, file)
@@ -124,7 +115,7 @@ func TestChunkRejectsOversizedBodyWithoutOverwritingNeighbor(t *testing.T) {
 
 func TestLargeOversizedBodyPreservesNeighborAndPartialProgress(t *testing.T) {
 	const size = 128 * 1024
-	d, run, file, progress := chunkFixture(t, io.NopCloser(strings.NewReader(strings.Repeat("x", size+1))), fmt.Sprintf("bytes 0-%d/%d", size-1, size+10), -1)
+	d, run, file := chunkFixture(t, io.NopCloser(strings.NewReader(strings.Repeat("x", size+1))), fmt.Sprintf("bytes 0-%d/%d", size-1, size+10), -1)
 	d.State.TotalSize = size + 10
 	d.State.Chunks[0].End = size - 1
 	if err := file.Truncate(size + 10); err != nil {
@@ -133,11 +124,11 @@ func TestLargeOversizedBodyPreservesNeighborAndPartialProgress(t *testing.T) {
 	if _, err := file.WriteAt([]byte("NEIGHBOR!!"), size); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.downloadAndWriteChunk(run, file, &d.State.Chunks[0], progress); err == nil {
+	if err := d.downloadAndWriteChunk(run, file, &d.State.Chunks[0]); err == nil {
 		t.Fatal("oversized streaming body accepted")
 	}
 	chunk := d.State.Chunks[0]
-	if chunk.Completed || chunk.Written != 64*1024 || totalProgress(progress) != chunk.Written {
+	if chunk.Completed || chunk.Written != 64*1024 || d.State.DownloadedSize != chunk.Written {
 		t.Fatalf("incorrect progress before invalid final buffer: %+v", chunk)
 	}
 	neighbor := make([]byte, 10)
@@ -150,22 +141,22 @@ func TestLargeOversizedBodyPreservesNeighborAndPartialProgress(t *testing.T) {
 }
 
 func TestChunkShortBodyPreservesPartialProgress(t *testing.T) {
-	d, run, file, progress := chunkFixture(t, io.NopCloser(strings.NewReader("abc")), "bytes 0-9/20", -1)
-	err := d.downloadAndWriteChunk(run, file, &d.State.Chunks[0], progress)
+	d, run, file := chunkFixture(t, io.NopCloser(strings.NewReader("abc")), "bytes 0-9/20", -1)
+	err := d.downloadAndWriteChunk(run, file, &d.State.Chunks[0])
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("expected short body error, got %v", err)
 	}
 	if chunk := d.State.Chunks[0]; chunk.Completed || chunk.Written != 3 {
 		t.Fatalf("incorrect partial state: %+v", chunk)
 	}
-	if n := totalProgress(progress); n != 3 {
+	if n := d.State.DownloadedSize; n != 3 {
 		t.Fatalf("partial progress lost: got %d, want 3", n)
 	}
 	assertNeighborUnchanged(t, file)
 }
 
 func TestChunkRetriesOnlyMissingBytes(t *testing.T) {
-	d, run, file, progress := chunkFixture(t, nil, "", -1)
+	d, run, file := chunkFixture(t, nil, "", -1)
 	var ranges []string
 	d.Client.Transport = testTransport(func(req *http.Request) (*http.Response, error) {
 		ranges = append(ranges, req.Header.Get("Range"))
@@ -178,7 +169,7 @@ func TestChunkRetriesOnlyMissingBytes(t *testing.T) {
 			return nil, fmt.Errorf("unexpected extra request")
 		}
 	})
-	if err := d.downloadChunkWithRetry(run, file, &d.State.Chunks[0], progress); err != nil {
+	if err := d.downloadChunkWithRetry(run, file, &d.State.Chunks[0]); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Join(ranges, ",") != "bytes=0-9,bytes=3-9" {
@@ -187,7 +178,7 @@ func TestChunkRetriesOnlyMissingBytes(t *testing.T) {
 	if chunk := d.State.Chunks[0]; !chunk.Completed || chunk.Written != 10 {
 		t.Fatalf("incorrect completed state: %+v", chunk)
 	}
-	if n := totalProgress(progress); n != 10 {
+	if n := d.State.DownloadedSize; n != 10 {
 		t.Fatalf("got progress %d, want 10", n)
 	}
 	data := make([]byte, 10)
@@ -198,16 +189,17 @@ func TestChunkRetriesOnlyMissingBytes(t *testing.T) {
 }
 
 func TestChunkResumesAtWrittenOffset(t *testing.T) {
-	d, run, file, progress := chunkFixture(t, io.NopCloser(strings.NewReader("defghij")), "bytes 3-9/20", 7)
+	d, run, file := chunkFixture(t, io.NopCloser(strings.NewReader("defghij")), "bytes 3-9/20", 7)
 	d.State.Chunks[0].Written = 3
+	d.State.DownloadedSize = 3
 	if _, err := file.WriteAt([]byte("abc"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.downloadAndWriteChunk(run, file, &d.State.Chunks[0], progress); err != nil {
+	if err := d.downloadAndWriteChunk(run, file, &d.State.Chunks[0]); err != nil {
 		t.Fatal(err)
 	}
-	if n := totalProgress(progress); n != 7 {
-		t.Fatalf("resume counted old bytes: %d", n)
+	if n := d.State.DownloadedSize; n != 10 {
+		t.Fatalf("resume counted bytes incorrectly: %d", n)
 	}
 	assertNeighborUnchanged(t, file)
 }
@@ -225,14 +217,14 @@ func (b *finalReadErrorBody) Read(p []byte) (int, error) {
 func (*finalReadErrorBody) Close() error { return nil }
 
 func TestChunkDoesNotCommitFinalBufferOnReadError(t *testing.T) {
-	d, run, file, progress := chunkFixture(t, &finalReadErrorBody{}, "bytes 0-9/20", -1)
-	if err := d.downloadAndWriteChunk(run, file, &d.State.Chunks[0], progress); !errors.Is(err, io.ErrUnexpectedEOF) {
+	d, run, file := chunkFixture(t, &finalReadErrorBody{}, "bytes 0-9/20", -1)
+	if err := d.downloadAndWriteChunk(run, file, &d.State.Chunks[0]); !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("expected final read error, got %v", err)
 	}
 	if chunk := d.State.Chunks[0]; chunk.Written != 0 || chunk.Completed {
 		t.Fatalf("failed final read committed bytes: %+v", chunk)
 	}
-	if n := totalProgress(progress); n != 0 {
+	if n := d.State.DownloadedSize; n != 0 {
 		t.Fatalf("failed final read reported %d bytes", n)
 	}
 	assertNeighborUnchanged(t, file)

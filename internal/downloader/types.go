@@ -48,6 +48,6 @@ const (
 	maxBlockSize             = 500 * 1024 * 1024
 	minBlockSize             = 256 * 1024
 	stateSaveInterval        = time.Second
-	stateSaveBytesThreshold  = 1 * 1024 * 1024
+	progressRefreshInterval  = 200 * time.Millisecond
 	defaultDownloadSubfolder = "GoFetchX"
 )

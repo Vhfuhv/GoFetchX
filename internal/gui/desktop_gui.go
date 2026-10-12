@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -517,14 +518,21 @@ func (g *DownloadGUI) buildCard(dl *DownloadItem) *fyne.Container {
 
 // listenDownload 事件驱动监听单个下载进度
 func (g *DownloadGUI) listenDownload(dl *DownloadItem) {
+	var refreshPending atomic.Bool
 	for {
 		select {
 		case <-dl.downloader.Notify:
 			if dl.downloader == nil {
 				continue
 			}
+			// Keep at most one queued refresh. Its callback reads the latest
+			// snapshot, so coalescing notifications cannot lose byte counts.
+			if !refreshPending.CompareAndSwap(false, true) {
+				continue
+			}
 
 			fyne.Do(func() {
+				refreshPending.Store(false)
 				select {
 				case <-dl.stopListen:
 					return

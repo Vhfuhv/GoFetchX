@@ -164,13 +164,8 @@ func (d *EnhancedDownloader) supportsRange(totalSize int64) (bool, error) {
 	return true, nil
 }
 
-func (d *EnhancedDownloader) showProgress(downloaded, total int64, startTime time.Time) {
+func (d *EnhancedDownloader) showProgress(downloaded, total int64, speed float64) {
 	percent := float64(downloaded) / float64(total) * 100
-
-	var speed float64
-	if elapsed := time.Since(startTime).Seconds(); elapsed > 0 {
-		speed = float64(downloaded) / elapsed / 1024 / 1024
-	}
 
 	barLength := 30
 	filled := int(float64(barLength) * percent / 100)

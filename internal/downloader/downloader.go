@@ -20,32 +20,37 @@ var (
 )
 
 type downloadSession struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	done     chan struct{}
-	state    *DownloadState
-	filePath string
-	started  time.Time
-	pathKeys []string
+	ctx               context.Context
+	cancel            context.CancelFunc
+	done              chan struct{}
+	state             *DownloadState
+	filePath          string
+	started           time.Time
+	initialDownloaded int64
+	pathKeys          []string
 }
 
 // EnhancedDownloader supports resumable ranged downloads.
 type EnhancedDownloader struct {
-	URL           string
-	Client        *http.Client
-	Concurrency   int
-	StateFile     string
-	State         *DownloadState
-	mutex         sync.Mutex
-	run           *downloadSession
-	rateLimiter   *RateLimiter
-	bandwidthInfo *BandwidthInfo
-	speedRatio    float64
-	DownloadDir   string
-	Notify        chan struct{}
-	lastStateSave time.Time
-	pendingBytes  int64
-	proxyConfig   ProxyConfig
+	URL            string
+	Client         *http.Client
+	Concurrency    int
+	StateFile      string
+	State          *DownloadState
+	mutex          sync.Mutex
+	lifecycleMutex sync.Mutex
+	persistMutex   sync.Mutex
+	run            *downloadSession
+	rateLimiter    *RateLimiter
+	bandwidthInfo  *BandwidthInfo
+	speedRatio     float64
+	DownloadDir    string
+	Notify         chan struct{}
+	lastStateSave  time.Time
+	stateRevision  uint64
+	savedRevision  uint64
+	stateWriter    func(string, DownloadState) error
+	proxyConfig    ProxyConfig
 }
 
 func NewEnhancedDownloader(url string, concurrency int) *EnhancedDownloader {
@@ -104,11 +109,27 @@ func (d *EnhancedDownloader) Snapshot() (DownloadState, bool) {
 		return DownloadState{}, false
 	}
 
-	state := *d.State
-	state.Chunks = append([]Chunk(nil), d.State.Chunks...)
-	state.ExpectedHashes = cloneHashes(d.State.ExpectedHashes)
-	state.ActualHashes = cloneHashes(d.State.ActualHashes)
+	state := cloneDownloadState(*d.State)
+	// Terminal status is staged for the final disk operation. Publish it only
+	// after the session has finished saving/removing state and released ownership.
+	if d.run != nil {
+		switch state.Status {
+		case "paused":
+			state.Status = "pausing"
+		case "cancelled":
+			state.Status = "cancelling"
+		case "completed", "error":
+			state.Status = "running"
+		}
+	}
 	return state, true
+}
+
+func cloneDownloadState(state DownloadState) DownloadState {
+	state.Chunks = append([]Chunk(nil), state.Chunks...)
+	state.ExpectedHashes = cloneHashes(state.ExpectedHashes)
+	state.ActualHashes = cloneHashes(state.ActualHashes)
+	return state
 }
 
 func cloneHashes(source map[string]string) map[string]string {
@@ -193,14 +214,20 @@ func (d *EnhancedDownloader) sendNotify() {
 }
 
 func (d *EnhancedDownloader) Start() error {
+	// Do not wait behind a slow lifecycle save just to reject an active session.
+	d.mutex.Lock()
+	err := d.activeSessionErrorLocked()
+	d.mutex.Unlock()
+	if err != nil {
+		return err
+	}
+	d.lifecycleMutex.Lock()
+	defer d.lifecycleMutex.Unlock()
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
-	if d.run != nil {
-		if d.State.Status == "running" {
-			return ErrDownloadRunning
-		}
-		return ErrDownloadStopping
+	if err := d.activeSessionErrorLocked(); err != nil {
+		return err
 	}
 	if d.Concurrency < 1 {
 		return fmt.Errorf("concurrency must be positive")
@@ -229,7 +256,7 @@ func (d *EnhancedDownloader) Start() error {
 			}
 
 			fmt.Printf("state says completed but target file is missing, restarting\n")
-			_ = os.Remove(d.StateFile)
+			_ = d.removeStateFileLocked()
 			d.State = nil
 			if err := d.initializeNewDownload(); err != nil {
 				return err
@@ -246,6 +273,12 @@ func (d *EnhancedDownloader) Start() error {
 		return err
 	}
 	pathKeys = append(pathKeys, fileKey)
+	// Repair aggregate counters from older snapshots where chunk offsets were
+	// updated before the asynchronous progress consumer caught up.
+	d.State.DownloadedSize = 0
+	for _, chunk := range d.State.Chunks {
+		d.State.DownloadedSize += chunk.Written
+	}
 	// All bytes arrived, but final validation (or finalization) failed. A
 	// retry must fetch the content again rather than skip every completed chunk.
 	if d.State.Status == "error" && allChunksComplete(d.State.Chunks) {
@@ -262,8 +295,8 @@ func (d *EnhancedDownloader) Start() error {
 	d.State.LastUpdateTime = time.Now()
 	d.State.DownloadDir = d.DownloadDir
 	d.lastStateSave = time.Time{}
-	d.pendingBytes = 0
-	if err := d.forceSaveState(); err != nil {
+	d.stateRevision++
+	if err := d.forceSaveStateLocked(); err != nil {
 		d.State.Status = "error"
 		d.State.ErrorMessage = err.Error()
 		return err
@@ -272,7 +305,8 @@ func (d *EnhancedDownloader) Start() error {
 	run := &downloadSession{
 		ctx: ctx, cancel: cancel, done: make(chan struct{}),
 		state: d.State, filePath: d.filePath(), started: time.Now(),
-		pathKeys: pathKeys,
+		pathKeys:          pathKeys,
+		initialDownloaded: d.State.DownloadedSize,
 	}
 	d.run = run
 	d.sendNotify()
@@ -282,6 +316,16 @@ func (d *EnhancedDownloader) Start() error {
 	return nil
 }
 
+func (d *EnhancedDownloader) activeSessionErrorLocked() error {
+	if d.run == nil {
+		return nil
+	}
+	if d.run.state.Status == "running" {
+		return ErrDownloadRunning
+	}
+	return ErrDownloadStopping
+}
+
 func (d *EnhancedDownloader) Pause() {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
@@ -289,22 +333,29 @@ func (d *EnhancedDownloader) Pause() {
 	if d.run != nil && d.State.Status == "running" {
 		d.State.Status = "pausing"
 		d.State.LastUpdateTime = time.Now()
+		d.stateRevision++
 		d.run.cancel()
 		d.sendNotify()
 	}
 }
 
 func (d *EnhancedDownloader) Cancel() {
+	d.lifecycleMutex.Lock()
+	defer d.lifecycleMutex.Unlock()
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 
 	if d.State != nil && (d.State.Status == "running" || d.State.Status == "pausing" || d.State.Status == "paused" || d.State.Status == "error") {
 		d.State.LastUpdateTime = time.Now()
+		d.stateRevision++
 		if d.run != nil {
 			d.State.Status = "cancelling"
 			// Persist cancellation intent in case the app exits before workers finish.
-			_ = d.forceSaveState()
 			d.run.cancel()
+			d.sendNotify()
+			if err := d.forceSaveStateLocked(); err != nil {
+				d.State.ErrorMessage = err.Error()
+			}
 		} else {
 			// A second instance may have resumed this URL since we paused. Do
 			// not remove the state file while that instance owns it.
@@ -314,7 +365,7 @@ func (d *EnhancedDownloader) Cancel() {
 			}
 			defer releaseDownloadPaths(d, []string{key})
 			d.State.Status = "cancelled"
-			_ = os.Remove(d.StateFile)
+			_ = d.removeStateFileLocked()
 		}
 		d.sendNotify()
 	}
@@ -395,7 +446,8 @@ func (d *EnhancedDownloader) initializeNewDownload() error {
 		fmt.Printf("save path: %s\n", d.filePath())
 	}
 
-	err = d.forceSaveState()
+	d.stateRevision++
+	err = d.forceSaveStateLocked()
 	saved = err == nil
 	return err
 }
@@ -417,7 +469,7 @@ func (d *EnhancedDownloader) downloadLoop(run *downloadSession) {
 func (d *EnhancedDownloader) downloadSession(run *downloadSession) error {
 	d.mutex.Lock()
 	run.state.DownloadStartTime = run.started
-	initialDownloaded := run.state.DownloadedSize
+	d.stateRevision++
 	totalSize := run.state.TotalSize
 	d.mutex.Unlock()
 
@@ -432,45 +484,15 @@ func (d *EnhancedDownloader) downloadSession(run *downloadSession) error {
 	}
 
 	var wg sync.WaitGroup
-	progressChan := make(chan int64, 100)
-
-	totalDownloaded := initialDownloaded
-
-	var progressWG sync.WaitGroup
-	progressWG.Add(1)
-
+	stopReports := make(chan struct{})
+	reportsDone := make(chan struct{})
 	go func() {
-		defer progressWG.Done()
-
-		var windowBytes int64
-		var windowStart time.Time
-
-		for n := range progressChan {
-			d.mutex.Lock()
-			totalDownloaded += n
-			run.state.DownloadedSize = totalDownloaded
-			run.state.LastUpdateTime = time.Now()
-
-			if windowStart.IsZero() {
-				windowStart = time.Now()
-			}
-			windowBytes += n
-			if windowElapsed := time.Since(windowStart).Seconds(); windowElapsed >= 2 {
-				run.state.CurrentSpeed = float64(windowBytes) / windowElapsed / 1024 / 1024
-				windowBytes = 0
-				windowStart = time.Now()
-			}
-
-			d.pendingBytes += n
-			if run.state.Status != "cancelling" {
-				_ = d.maybeSaveStateLocked()
-			}
-			d.mutex.Unlock()
-
-			d.sendNotify()
-			d.showProgress(totalDownloaded, totalSize, run.started)
-		}
+		defer close(reportsDone)
+		d.reportProgress(run, stopReports)
 	}()
+	stopSaves := make(chan struct{})
+	saveResult := make(chan error, 1)
+	go func() { saveResult <- d.persistProgress(run, stopSaves) }()
 
 	var chunkErr error
 	var setChunkErr sync.Once
@@ -496,7 +518,7 @@ func (d *EnhancedDownloader) downloadSession(run *downloadSession) error {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			if err := d.downloadChunkWithRetry(run, file, c, progressChan); err != nil {
+			if err := d.downloadChunkWithRetry(run, file, c); err != nil {
 				select {
 				case <-run.ctx.Done():
 					return
@@ -514,14 +536,20 @@ func (d *EnhancedDownloader) downloadSession(run *downloadSession) error {
 done:
 
 	wg.Wait()
-	close(progressChan)
-	progressWG.Wait()
+	close(stopReports)
+	close(stopSaves)
+	<-reportsDone
+	if saveErr := <-saveResult; chunkErr == nil {
+		chunkErr = saveErr
+	}
 
 	return chunkErr
 }
 
-// Only publish a terminal state after workers, progress accounting and file close finish.
+// Only publish a terminal state after workers, periodic saves and file close finish.
 func (d *EnhancedDownloader) finishSession(run *downloadSession, err error) {
+	d.lifecycleMutex.Lock()
+	defer d.lifecycleMutex.Unlock()
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
 	defer d.sendNotify()
@@ -562,9 +590,13 @@ func (d *EnhancedDownloader) finishSession(run *downloadSession, err error) {
 			fmt.Printf("\ndownload completed: %s\n", run.filePath)
 		}
 	}
+	d.stateRevision++
 	if state.Status == "cancelled" {
-		_ = os.Remove(d.StateFile)
-	} else if saveErr := d.forceSaveState(); saveErr != nil {
+		if removeErr := d.removeStateFileLocked(); removeErr != nil && !os.IsNotExist(removeErr) {
+			state.Status = "error"
+			state.ErrorMessage = removeErr.Error()
+		}
+	} else if saveErr := d.forceSaveStateLocked(); saveErr != nil {
 		state.Status = "error"
 		state.ErrorMessage = saveErr.Error()
 		state.FinalDuration = 0

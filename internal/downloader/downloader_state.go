@@ -53,44 +53,81 @@ func legacyStatePath(url string) string {
 	return "download_" + hex.EncodeToString(hash[:8]) + ".json"
 }
 
-func (d *EnhancedDownloader) saveState() error {
-	if d.State == nil {
-		return nil
-	}
-
-	if err := EnsureDir(appStateDir()); err != nil {
+func writeStateSnapshot(statePath string, state DownloadState) error {
+	if err := EnsureDir(filepath.Dir(statePath)); err != nil {
 		return err
 	}
 
-	data, err := json.MarshalIndent(d.State, "", "  ")
+	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	d.StateFile = d.currentStatePath()
-	tmpPath := d.StateFile + ".tmp"
+	tmpPath := statePath + ".tmp"
 
 	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
 		return err
 	}
 
-	return replaceFileAtomically(tmpPath, d.StateFile)
+	return replaceFileAtomically(tmpPath, statePath)
 }
 
 func (d *EnhancedDownloader) forceSaveState() error {
-	if err := d.saveState(); err != nil {
+	return d.persistState(nil, true)
+}
+
+// Serialize writers before taking a snapshot: a slow old snapshot must never
+// overwrite a newer forced save. Encoding and I/O do not hold the state mutex.
+func (d *EnhancedDownloader) persistState(run *downloadSession, force bool) error {
+	d.persistMutex.Lock()
+	defer d.persistMutex.Unlock()
+	d.mutex.Lock()
+	if d.State == nil || (!force && (run == nil || d.run != run || run.state.Status != "running" || d.savedRevision == d.stateRevision || time.Since(d.lastStateSave) < stateSaveInterval)) {
+		d.mutex.Unlock()
+		return nil
+	}
+	stateRef := d.State
+	state := cloneDownloadState(*stateRef)
+	revision := d.stateRevision
+	statePath := d.currentStatePath()
+	d.StateFile = statePath
+	writer := d.stateWriter
+	if writer == nil {
+		writer = writeStateSnapshot
+	}
+	d.mutex.Unlock()
+	if err := writer(statePath, state); err != nil {
 		return err
 	}
-	d.lastStateSave = time.Now()
-	d.pendingBytes = 0
+	d.mutex.Lock()
+	if d.State == stateRef {
+		d.savedRevision = revision
+		d.lastStateSave = time.Now()
+	}
+	d.mutex.Unlock()
 	return nil
 }
 
-func (d *EnhancedDownloader) maybeSaveStateLocked() error {
-	if time.Since(d.lastStateSave) < stateSaveInterval && d.pendingBytes < stateSaveBytesThreshold {
-		return nil
-	}
-	return d.forceSaveState()
+// Lifecycle callers hold lifecycleMutex and mutex. Drop only the state mutex
+// around I/O so snapshots/accounting stay responsive while lifecycle stays fixed.
+func (d *EnhancedDownloader) forceSaveStateLocked() error {
+	d.mutex.Unlock()
+	err := d.forceSaveState()
+	d.mutex.Lock()
+	return err
+}
+
+func (d *EnhancedDownloader) removeStateFileLocked() error {
+	return d.removeStatePathLocked(d.StateFile)
+}
+
+func (d *EnhancedDownloader) removeStatePathLocked(statePath string) error {
+	d.mutex.Unlock()
+	d.persistMutex.Lock()
+	err := os.Remove(statePath)
+	d.persistMutex.Unlock()
+	d.mutex.Lock()
+	return err
 }
 
 func (d *EnhancedDownloader) loadState() error {
@@ -116,8 +153,8 @@ func (d *EnhancedDownloader) loadState() error {
 	if d.State.DownloadDir != "" {
 		d.DownloadDir = d.State.DownloadDir
 	}
-	_ = d.saveState()
-	_ = os.Remove(legacyPath)
+	_ = d.forceSaveStateLocked()
+	_ = d.removeStatePathLocked(legacyPath)
 	return nil
 }
 
