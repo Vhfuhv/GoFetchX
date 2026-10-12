@@ -445,6 +445,18 @@ func (g *DownloadGUI) buildCard(dl *DownloadItem) *fyne.Container {
 				g.cancelDownload(dl)
 			}),
 		)
+	case "pausing":
+		pauseBtn := widget.NewButton("暂停中...", nil)
+		pauseBtn.Disable()
+		buttons = append(buttons, pauseBtn,
+			widget.NewButtonWithIcon("取消", theme.CancelIcon(), func() {
+				g.cancelDownload(dl)
+			}),
+		)
+	case "cancelling":
+		cancelBtn := widget.NewButton("取消中...", nil)
+		cancelBtn.Disable()
+		buttons = append(buttons, cancelBtn)
 	case "error":
 		buttons = append(buttons,
 			widget.NewButtonWithIcon("重试", theme.MediaPlayIcon(), func() {
@@ -489,27 +501,34 @@ func (g *DownloadGUI) listenDownload(dl *DownloadItem) {
 	for {
 		select {
 		case <-dl.downloader.Notify:
-			if dl.downloader == nil || dl.downloader.State == nil {
+			if dl.downloader == nil {
 				continue
 			}
-
-			state, ok := dl.downloader.Snapshot()
-			if !ok {
-				continue
-			}
-
-			status := state.Status
-			downloaded := state.DownloadedSize
-			total := state.TotalSize
-			fileName := state.FileName
-			speed := state.CurrentSpeed
-			startTime := state.DownloadStartTime
-			finalDuration := state.FinalDuration
-			accumulated := state.AccumulatedDuration
-
-			needRefresh := status != dl.Status
 
 			fyne.Do(func() {
+				select {
+				case <-dl.stopListen:
+					return
+				default:
+				}
+				// Read the latest state on the GUI thread, so queued events cannot
+				// restore an outdated running state after the user has paused.
+				state, ok := dl.downloader.Snapshot()
+				if !ok {
+					return
+				}
+
+				status := state.Status
+				downloaded := state.DownloadedSize
+				total := state.TotalSize
+				fileName := state.FileName
+				speed := state.CurrentSpeed
+				startTime := state.DownloadStartTime
+				finalDuration := state.FinalDuration
+				accumulated := state.AccumulatedDuration
+
+				needRefresh := status != dl.Status
+
 				// 状态变更时先重建卡片，再更新新控件
 				if needRefresh {
 					dl.Status = status
@@ -570,7 +589,9 @@ func (g *DownloadGUI) listenDownload(dl *DownloadItem) {
 func (g *DownloadGUI) pauseDownload(dl *DownloadItem) {
 	if dl.downloader != nil {
 		dl.downloader.Pause()
-		dl.Status = "paused"
+		if state, ok := dl.downloader.Snapshot(); ok {
+			dl.Status = state.Status
+		}
 		g.refreshList()
 	}
 }
@@ -581,7 +602,9 @@ func (g *DownloadGUI) resumeDownload(dl *DownloadItem) {
 			dialog.ShowError(fmt.Errorf("继续下载失败: %w", err), g.window)
 			return
 		}
-		dl.Status = "running"
+		if state, ok := dl.downloader.Snapshot(); ok {
+			dl.Status = state.Status
+		}
 		g.refreshList()
 	}
 }
@@ -671,11 +694,13 @@ func (g *DownloadGUI) saveConfig() {
 
 func statusText(status string) string {
 	texts := map[string]string{
-		"running":   "下载中",
-		"paused":    "已暂停",
-		"completed": "已完成",
-		"error":     "失败",
-		"cancelled": "已取消",
+		"running":    "下载中",
+		"pausing":    "暂停中",
+		"paused":     "已暂停",
+		"completed":  "已完成",
+		"error":      "失败",
+		"cancelled":  "已取消",
+		"cancelling": "取消中",
 	}
 	if t, ok := texts[status]; ok {
 		return t
@@ -762,13 +787,13 @@ func statusColor(status string) color.Color {
 	switch status {
 	case "running":
 		return color.NRGBA{R: 18, G: 122, B: 72, A: 255}
-	case "paused":
+	case "paused", "pausing":
 		return color.NRGBA{R: 161, G: 98, B: 7, A: 255}
 	case "completed":
 		return color.NRGBA{R: 29, G: 78, B: 216, A: 255}
 	case "error":
 		return color.NRGBA{R: 185, G: 28, B: 28, A: 255}
-	case "cancelled":
+	case "cancelled", "cancelling":
 		return color.NRGBA{R: 107, G: 114, B: 128, A: 255}
 	default:
 		return color.NRGBA{R: 75, G: 85, B: 99, A: 255}
@@ -779,13 +804,13 @@ func statusBadgeColor(status string) color.Color {
 	switch status {
 	case "running":
 		return color.NRGBA{R: 220, G: 252, B: 231, A: 255}
-	case "paused":
+	case "paused", "pausing":
 		return color.NRGBA{R: 254, G: 243, B: 199, A: 255}
 	case "completed":
 		return color.NRGBA{R: 219, G: 234, B: 254, A: 255}
 	case "error":
 		return color.NRGBA{R: 254, G: 226, B: 226, A: 255}
-	case "cancelled":
+	case "cancelled", "cancelling":
 		return color.NRGBA{R: 229, G: 231, B: 235, A: 255}
 	default:
 		return color.NRGBA{R: 243, G: 244, B: 246, A: 255}

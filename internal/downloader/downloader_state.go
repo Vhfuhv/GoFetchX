@@ -181,7 +181,10 @@ func LoadRecoverableDownloaders() ([]*EnhancedDownloader, error) {
 		switch state.Status {
 		case "completed", "cancelled":
 			continue
-		case "running":
+		case "cancelling":
+			_ = os.Remove(path)
+			continue
+		case "running", "pausing":
 			state.Status = "paused"
 			state.CurrentSpeed = 0
 			state.LastUpdateTime = time.Now()
